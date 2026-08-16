@@ -4,14 +4,32 @@ from genlayer import *
 import json
 from dataclasses import dataclass
 
+def parse_llm_json(text) -> dict:
+    """Robust JSON parser to strip markdown formatting injected by LLMs."""
+    try:
+        cleaned = str(text).strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        return json.loads(cleaned.strip())
+    except Exception as e:
+        return {"verdict": "ESCALATE", "reason": f"Parse error: {str(e)}"}
+
 @allow_storage
 @dataclass
 class Order:
-    buyer: Address
-    seller: Address
+    buyer: str
+    seller: str
     requirements: str
     amount: bigint
-    status: str # "PENDING", "FULFILLED", "REFUNDED", "ESCALATED"
+    seller_stake: bigint
+    status: str
+    video_url: str
+    verdict: str
+    reason: str
 
 class Contract(gl.Contract):
     def __init__(self):
@@ -20,114 +38,161 @@ class Contract(gl.Contract):
 
     @gl.public.write.payable
     def create_order(self, requirements: str) -> str:
-        if gl.message.value <= bigint(0):
+        """Buyer creates a prompt request and deposits the payment."""
+        amount = gl.message.value
+        if amount <= bigint(0):
             raise UserError("Amount must be greater than 0")
         
         order_id = str(self.next_order_id)
         self.next_order_id += bigint(1)
         
         self.orders[order_id] = Order(
-            buyer=gl.message.sender,
-            seller=Address("0x0000000000000000000000000000000000000000"),
+            buyer=gl.message.sender.as_hex,
+            seller="",
             requirements=requirements,
-            amount=gl.message.value,
-            status="PENDING"
+            amount=amount,
+            seller_stake=bigint(0),
+            status="OPEN",
+            video_url="",
+            verdict="NONE",
+            reason=""
         )
         return order_id
 
-    @gl.public.write
+    @gl.public.write.payable
     def fulfill_order(self, order_id: str, preview_url: str) -> None:
+        """Seller submits the generated video URL and MUST stake GEN tokens."""
         if order_id not in self.orders:
             raise UserError("Order not found")
         order = self.orders[order_id]
-        if order.status != "PENDING":
-            raise UserError("Order is not pending")
-            
-        reqs = order.requirements
         
-        def leader_fn() -> str:
+        if order.status != "OPEN":
+            raise UserError("Order is not OPEN")
+            
+        stake = gl.message.value
+        if stake <= bigint(0):
+            raise UserError("Seller must stake GEN to fulfill this order. Stake will be slashed if video is invalid.")
+            
+        order.seller = gl.message.sender.as_hex
+        order.seller_stake = stake
+        order.video_url = preview_url
+        order.status = "IN_PROGRESS"
+        
+        # Capture variables into closure for the nondet block
+        reqs_str = str(order.requirements)
+        url_str = str(preview_url)
+
+        def leader_fn() -> dict:
             try:
-                page_data = gl.nondet.web.render(preview_url)
-                if not page_data:
-                    return '{"verdict": "ESCALATE", "reason": "Failed to fetch URL content"}'
-            except Exception:
-                return '{"verdict": "ESCALATE", "reason": "Exception while fetching URL"}'
+                # web.render API fix
+                res_web = gl.nondet.web.render(url_str)
+                content = res_web.content if hasattr(res_web, "content") else str(res_web)
+                if any(err in content[:400].lower() for err in ["404 not found", "error 404"]):
+                    return {"verdict": "SLASH", "reason": "Dead URL submitted. Slashing stake to protect buyer."}
+            except Exception as e:
+                return {"verdict": "SLASH", "reason": f"Network error fetching URL: {str(e)}. Slashing stake."}
 
             prompt = f"""
-            Analyze the video content from the provided metadata or text description.
-            Requirements from buyer: {reqs}
+            You are an expert AI video evaluator judging a Prompt-to-Earn transaction.
+            Analyze the video content metadata below.
             
-            Does the video content meet the strict requirements (e.g., specific objects, camera motions, background consistency)?
-            If yes, output RELEASE.
-            If no, output REFUND.
-            If the URL content is broken or not accessible, output ESCALATE.
+            Buyer's Requirements: {reqs_str}
+            (e.g., Check strictly if it generates high-quality promotional video slideshows for specific subjects like children's footwear / dép trẻ em, executes specific camera motions smoothly, and completely preserves background consistency).
             
-            Return JSON in this format:
-            {{"verdict": "RELEASE" | "REFUND" | "ESCALATE", "reason": "detailed explanation"}}
+            Video Content Data:
+            {content[:2500]}
+            
+            Decide on ONE verdict:
+            - RELEASE: The AI video perfectly matches the subject, camera motions, and background requirements.
+            - SLASH: The video is completely irrelevant, missing the core subject, or fails the technical camera/background rules.
+            - ESCALATE: Unsure or missing information.
+            
+            Return JSON format exactly:
+            {{"verdict": "RELEASE|SLASH|ESCALATE", "reason": "detailed explanation"}}
             """
-            
-            result = gl.nondet.exec_prompt(prompt, response_format="json")
-            return result
-
-        def validator_fn(leader_result: str) -> bool:
-            leader_verdict = "ESCALATE"
-            if '"verdict": "RELEASE"' in leader_result.replace(" ", ""):
-                leader_verdict = "RELEASE"
-            elif '"verdict": "REFUND"' in leader_result.replace(" ", ""):
-                leader_verdict = "REFUND"
-
             try:
-                page_data = gl.nondet.web.render(preview_url)
-                if not page_data:
-                    return leader_verdict == "ESCALATE"
-            except Exception:
-                return leader_verdict == "ESCALATE"
+                llm_res = gl.nondet.exec_prompt(prompt, response_format="json")
+                text_res = llm_res.content if hasattr(llm_res, "content") else str(llm_res)
+                return parse_llm_json(text_res)
+            except Exception as e:
+                return {"verdict": "ESCALATE", "reason": f"LLM error: {str(e)}"}
 
-            prompt = f"""
-            Analyze the video content from the provided metadata or text description.
-            Requirements from buyer: {reqs}
-            
-            Does the video content meet the strict requirements (e.g., specific objects, camera motions, background consistency)?
-            If yes, output RELEASE.
-            If no, output REFUND.
-            If the URL content is broken or not accessible, output ESCALATE.
-            
-            Return JSON in this format:
-            {{"verdict": "RELEASE" | "REFUND" | "ESCALATE", "reason": "detailed explanation"}}
-            """
-            
-            result = gl.nondet.exec_prompt(prompt, response_format="json")
-            validator_verdict = "ESCALATE"
-            if '"verdict": "RELEASE"' in result.replace(" ", ""):
-                validator_verdict = "RELEASE"
-            elif '"verdict": "REFUND"' in result.replace(" ", ""):
-                validator_verdict = "REFUND"
+        def validator_fn(leader_data: dict) -> bool:
+            # Type enforcing
+            if not isinstance(leader_data, dict):
+                return False
                 
-            return leader_verdict == validator_verdict
-
-        consensus_result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
-        
-        verdict = "ESCALATE"
-        if '"verdict": "RELEASE"' in consensus_result.replace(" ", ""):
-            verdict = "RELEASE"
-        elif '"verdict": "REFUND"' in consensus_result.replace(" ", ""):
-            verdict = "REFUND"
+            mine_data = leader_fn()
             
+            # ONLY compare verdicts to ensure consensus; ignore differing reason strings
+            v_leader = str(leader_data.get("verdict", "")).upper().strip()
+            v_mine = str(mine_data.get("verdict", "")).upper().strip()
+            return v_leader == v_mine
+
+        # Execute consensus within a safe sandbox
+        result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        if not isinstance(result, dict):
+            result = parse_llm_json(str(result))
+            
+        verdict = str(result.get("verdict", "ESCALATE")).upper()
+        if verdict not in ["RELEASE", "SLASH", "ESCALATE"]:
+            verdict = "ESCALATE"
+            
+        order.verdict = verdict
+        order.reason = str(result.get("reason", "No reason provided"))
+        
+        buyer_addr = Address(order.buyer)
+        seller_addr = Address(order.seller)
+        
+        # Game Theory Payout Logic & Fallbacks
         if verdict == "RELEASE":
             order.status = "FULFILLED"
-            order.seller = gl.message.sender
-            self.orders[order_id] = order
-            gl.get_contract_at(gl.message.sender).emit_transfer(value=order.amount)
-        elif verdict == "REFUND":
-            order.status = "REFUNDED"
-            self.orders[order_id] = order
-            gl.get_contract_at(order.buyer).emit_transfer(value=order.amount)
+            # Seller earns the payment + gets their stake back
+            gl.get_contract_at(seller_addr).emit_transfer(value=order.amount + order.seller_stake)
+        elif verdict == "SLASH":
+            order.status = "SLASHED"
+            # Seller failed. Refund the buyer + Slash seller's stake and award it to the buyer
+            gl.get_contract_at(buyer_addr).emit_transfer(value=order.amount + order.seller_stake)
         else:
             order.status = "ESCALATED"
-            self.orders[order_id] = order
+            # Fallback: if AI cannot decide (ESCALATE), safely return funds to BOTH to avoid locking capital forever
+            if order.amount > bigint(0):
+                gl.get_contract_at(buyer_addr).emit_transfer(value=order.amount)
+            if order.seller_stake > bigint(0):
+                gl.get_contract_at(seller_addr).emit_transfer(value=order.seller_stake)
+            
+        self.orders[order_id] = order
 
-    @gl.public.read
-    def get_order(self, order_id: str) -> Order:
+    @gl.public.write
+    def cancel_order(self, order_id: str) -> None:
+        """Allows buyer to cancel and refund if no seller has accepted yet."""
         if order_id not in self.orders:
             raise UserError("Order not found")
-        return self.orders[order_id]
+        order = self.orders[order_id]
+        
+        if gl.message.sender.as_hex != order.buyer:
+            raise UserError("Only buyer can cancel")
+        if order.status != "OPEN":
+            raise UserError("Can only cancel OPEN orders")
+            
+        order.status = "CANCELLED"
+        self.orders[order_id] = order
+        gl.get_contract_at(Address(order.buyer)).emit_transfer(value=order.amount)
+
+    @gl.public.read
+    def get_order(self, order_id: str) -> str:
+        """Returns a JSON string to ensure schema compatibility."""
+        if order_id not in self.orders:
+            raise UserError("Order not found")
+        o = self.orders[order_id]
+        return json.dumps({
+            "buyer": o.buyer,
+            "seller": o.seller,
+            "requirements": o.requirements,
+            "amount": str(o.amount),
+            "seller_stake": str(o.seller_stake),
+            "status": o.status,
+            "video_url": o.video_url,
+            "verdict": o.verdict,
+            "reason": o.reason
+        })
