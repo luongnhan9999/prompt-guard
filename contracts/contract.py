@@ -1,7 +1,6 @@
 # v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
-import json
 
 @allow_storage
 @dataclass
@@ -13,9 +12,11 @@ class Order:
     status: str # "PENDING", "FULFILLED", "REFUNDED", "ESCALATED"
 
 class Contract(gl.Contract):
+    orders: TreeMap[str, Order]
+    next_order_id: bigint
+
     def __init__(self):
-        self.orders: TreeMap[str, Order] = TreeMap()
-        self.next_order_id: bigint = bigint(1)
+        self.next_order_id = bigint(1)
 
     @gl.public.write.payable
     def create_order(self, requirements: str) -> str:
@@ -45,13 +46,12 @@ class Contract(gl.Contract):
         reqs = order.requirements
         
         def leader_fn() -> str:
-            # Failsafe: if web.render returns network error
             try:
                 page_data = gl.nondet.web.render(preview_url)
                 if not page_data:
-                    return json.dumps({"verdict": "ESCALATE", "reason": "Failed to fetch URL content"})
+                    return '{"verdict": "ESCALATE", "reason": "Failed to fetch URL content"}'
             except Exception:
-                return json.dumps({"verdict": "ESCALATE", "reason": "Exception while fetching URL"})
+                return '{"verdict": "ESCALATE", "reason": "Exception while fetching URL"}'
 
             prompt = f"""
             Analyze the video content from the provided metadata or text description.
@@ -70,11 +70,11 @@ class Contract(gl.Contract):
             return result
 
         def validator_fn(leader_result: str) -> bool:
-            try:
-                leader_json = json.loads(leader_result)
-                leader_verdict = leader_json.get("verdict", "")
-            except Exception:
-                return False
+            leader_verdict = "ESCALATE"
+            if '"verdict": "RELEASE"' in leader_result.replace(" ", ""):
+                leader_verdict = "RELEASE"
+            elif '"verdict": "REFUND"' in leader_result.replace(" ", ""):
+                leader_verdict = "REFUND"
 
             try:
                 page_data = gl.nondet.web.render(preview_url)
@@ -97,20 +97,21 @@ class Contract(gl.Contract):
             """
             
             result = gl.nondet.exec_prompt(prompt, response_format="json")
-            try:
-                validator_json = json.loads(result)
-                validator_verdict = validator_json.get("verdict", "")
-                return leader_verdict == validator_verdict
-            except Exception:
-                return False
+            validator_verdict = "ESCALATE"
+            if '"verdict": "RELEASE"' in result.replace(" ", ""):
+                validator_verdict = "RELEASE"
+            elif '"verdict": "REFUND"' in result.replace(" ", ""):
+                validator_verdict = "REFUND"
+                
+            return leader_verdict == validator_verdict
 
-        consensus_result = gl.vm.run_nondet(leader_fn, validator_fn)
+        consensus_result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         
-        try:
-            res_dict = json.loads(consensus_result)
-            verdict = res_dict.get("verdict", "ESCALATE")
-        except Exception:
-            verdict = "ESCALATE"
+        verdict = "ESCALATE"
+        if '"verdict": "RELEASE"' in consensus_result.replace(" ", ""):
+            verdict = "RELEASE"
+        elif '"verdict": "REFUND"' in consensus_result.replace(" ", ""):
+            verdict = "REFUND"
             
         if verdict == "RELEASE":
             order.status = "FULFILLED"
