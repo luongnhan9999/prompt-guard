@@ -1,6 +1,8 @@
 # v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
+import json
+from dataclasses import dataclass
 
 @allow_storage
 @dataclass
@@ -12,11 +14,9 @@ class Order:
     status: str # "PENDING", "FULFILLED", "REFUNDED", "ESCALATED"
 
 class Contract(gl.Contract):
-    orders: TreeMap[str, Order]
-    next_order_id: bigint
-
     def __init__(self):
-        self.next_order_id = bigint(1)
+        self.orders: TreeMap[str, Order]
+        self.next_order_id: bigint = bigint(1)
 
     @gl.public.write.payable
     def create_order(self, requirements: str) -> str:
