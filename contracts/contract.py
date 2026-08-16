@@ -97,7 +97,7 @@ class Contract(gl.Contract):
             Analyze the video content metadata below.
             
             Buyer's Requirements: {reqs_str}
-            (e.g., Check strictly if it generates high-quality promotional video slideshows for specific subjects like children's footwear / dép trẻ em, executes specific camera motions smoothly, and completely preserves background consistency).
+            (e.g., Check strictly if it generates high-quality promotional video slideshows for specific subjects like children's footwear, executes specific camera motions smoothly, and completely preserves background consistency).
             
             Video Content Data:
             {content[:2500]}
@@ -117,14 +117,19 @@ class Contract(gl.Contract):
             except Exception as e:
                 return {"verdict": "ESCALATE", "reason": f"LLM error: {str(e)}"}
 
-        def validator_fn(leader_data: dict) -> bool:
-            # Type enforcing
+        def validator_fn(leaders_res) -> bool:
+            # Verify leader returned successfully
+            if not isinstance(leaders_res, gl.vm.Return):
+                return False
+
+            leader_data = leaders_res.calldata
             if not isinstance(leader_data, dict):
                 return False
-                
+
             mine_data = leader_fn()
-            
-            # ONLY compare verdicts to ensure consensus; ignore differing reason strings
+
+            # ONLY compare verdicts (MEANING) to ensure consensus;
+            # ignore differing reason strings
             v_leader = str(leader_data.get("verdict", "")).upper().strip()
             v_mine = str(mine_data.get("verdict", "")).upper().strip()
             return v_leader == v_mine
