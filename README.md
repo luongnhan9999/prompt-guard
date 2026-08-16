@@ -80,7 +80,7 @@ The `fulfill_order` method defines a non-deterministic block via
 | Field | Value |
 |-------|-------|
 | **Network** | studionet |
-| **Contract Address** | `0x89512bE8D35f69e9CeC585DDAEf5A521CB1e9e98` |
+| **Contract Address** | `0x306D52dA4292e908E00212e48Fd0F2c94A170caA` |
 
 ### Illustrative Example (Expected Output)
 
