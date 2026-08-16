@@ -1,39 +1,128 @@
 # PromptGuard
 
-An automated escrow and AI adjudication platform primitive for trading AI video generation prompts.
+A reusable escrow primitive for AI-generated content with staking-based
+game-theory incentives and GenLayer AI consensus adjudication.
 
-## Purpose
-PromptGuard solves the problem of trust between a buyer and a seller of AI generation prompts (such as video prompts for Veo3). It acts as an escrow that automatically releases funds to the seller if the submitted prompt generates the expected result, or refunds the buyer if it fails.
+## Problem
+
+Buyers and sellers of AI prompts (e.g., Veo3 video prompts) have no trustless
+way to transact. A buyer cannot verify quality before paying; a seller cannot
+guarantee payment after delivering. Traditional smart contracts cannot judge
+subjective quality.
+
+## Solution
+
+PromptGuard escrows the buyer's payment **and** requires the seller to stake
+GEN tokens as skin-in-the-game. When the seller submits a preview URL, the
+contract triggers GenLayer's non-deterministic AI consensus to evaluate
+whether the deliverable meets the buyer's requirements.
 
 ## Public API
-- `create_order(requirements: str) -> str`: (Payable) Escrows funds and creates a new order specifying the exact visual requirements (e.g. camera motion, objects, background).
-- `fulfill_order(order_id: str, preview_url: str)`: Seller submits a fulfillment link to the preview video/result. Triggers the AI consensus to evaluate the submission.
-- `get_order(order_id: str) -> Order`: Retrieves the state of an order.
+
+| Method | Decorator | Description |
+|--------|-----------|-------------|
+| `create_order(requirements)` | `@gl.public.write.payable` | Buyer escrows GEN and specifies requirements |
+| `fulfill_order(order_id, preview_url)` | `@gl.public.write.payable` | Seller stakes GEN + submits preview URL; triggers AI adjudication |
+| `cancel_order(order_id)` | `@gl.public.write` | Buyer cancels an OPEN order (full refund) |
+| `get_order(order_id)` | `@gl.public.view` | Returns order state as JSON |
+
+## Order Lifecycle
+
+```
+OPEN --> IN_PROGRESS --> FULFILLED  (seller paid + stake returned)
+  |          |--------> SLASHED    (buyer refunded + seller stake slashed)
+  |          |--------> ESCALATED  (both sides refunded)
+  |
+  +----> CANCELLED (buyer refunded)
+```
 
 ## How Consensus Works
-PromptGuard utilizes GenLayer's non-deterministic AI execution capabilities.
-The `fulfill_order` function defines a non-deterministic block using `gl.vm.run_nondet(leader_fn, validator_fn)`.
 
-**The Validator check focuses on MEANING, not format.**
-The leader AI and validator AI both fetch the preview URL and evaluate the content against the buyer's strict requirements. The validator does not just check if the leader output valid JSON; it performs its own evaluation of the prompt's efficacy. 
-Crucially, the `validator_fn` parses both the leader's and its own decision, and ONLY compares the final categorical verdict (`RELEASE`, `REFUND`, or `ESCALATE`). It completely ignores the `reason` string, meaning two nodes that agree on the outcome but cite different reasoning will successfully reach consensus.
+The `fulfill_order` method defines a non-deterministic block via
+`gl.vm.run_nondet_unsafe(leader_fn, validator_fn)`.
+
+1. **Leader** fetches the preview URL with `gl.nondet.web.render`, feeds the
+   page content + buyer requirements into `gl.nondet.exec_prompt`, and returns
+   a JSON dict with `verdict` and `reason`.
+
+2. **Validator** receives the leader's result (wrapped in `gl.vm.Return`),
+   extracts `.calldata`, then **independently re-runs the same leader logic**
+   to produce its own verdict.
+
+3. **Consensus criterion**: the validator compares **only the categorical
+   verdict** (`RELEASE`, `SLASH`, or `ESCALATE`) between its own evaluation
+   and the leader's. The `reason` string is completely ignored. This means two
+   nodes that agree on the outcome but cite different reasoning will pass
+   consensus, while two nodes that disagree on the outcome will always fail --
+   regardless of formatting.
+
+### Payout Rules (Game Theory)
+
+| Verdict | Buyer | Seller | Rationale |
+|---------|-------|--------|-----------|
+| RELEASE | -- | payment + stake back | Work accepted |
+| SLASH | refund + seller's stake | loses stake | Bad-faith submission |
+| ESCALATE | refund | stake back | AI uncertain; no party penalized |
+
+## Edge-Case Handling
+
+- Zero payment or zero stake rejected with `gl.vm.UserError`
+- Order-not-found and wrong-status guards on every mutation
+- Dead URL (404) detected in leader -> returns SLASH
+- Network exception during `web.render` -> returns SLASH
+- LLM failure -> returns ESCALATE (safe fallback)
+- JSON parse failure -> returns ESCALATE via `parse_llm_json` helper
+- `cancel_order` restricted to buyer + OPEN status only
+- ESCALATE refunds both parties (capital never locked permanently)
 
 ## Deployment
-**Network**: studionet
-**CONTRACT_ADDRESS**: `[WILL BE PROVIDED BY DEPLOYER]`
 
-### Example Execution (Expected Output)
-**Input**:
-Buyer calls `create_order("childrens footwear, specific camera motion")` with 10 GEN.
-Seller calls `fulfill_order("1", "https://example.com/veo3/preview/123")` where the video perfectly matches.
+| Field | Value |
+|-------|-------|
+| **Network** | studionet |
+| **Contract Address** | `0x89512bE8D35f69e9CeC585DDAEf5A521CB1e9e98` |
 
-**Expected Outcome**:
-The leader node evaluates the video, finding it matches the children's footwear and camera motion requirement, and outputs:
-```json
-{"verdict": "RELEASE", "reason": "The video prominently features children's footwear and the requested camera panning motion."}
+### Illustrative Example (Expected Output)
+
+**Step 1 -- Buyer creates order:**
 ```
-The validator node also evaluates the video independently and outputs:
-```json
-{"verdict": "RELEASE", "reason": "Criteria met: children's footwear present. Camera motion correct."}
+create_order("High-quality promotional video slideshow for children footwear with smooth camera panning and consistent background")
+value: 10 GEN
 ```
-Because `leader_verdict == validator_verdict` ("RELEASE" == "RELEASE"), the consensus succeeds. The escrowed 10 GEN is transferred to the seller, and the order status is updated to `FULFILLED`.
+Returns: `"1"` (order ID)
+
+**Step 2 -- Seller fulfills with a matching video preview:**
+```
+fulfill_order("1", "https://example.com/veo3/preview/abc123")
+value: 5 GEN (seller stake)
+```
+
+**Expected AI consensus result:**
+```json
+{
+  "verdict": "RELEASE",
+  "reason": "The video features children footwear prominently with smooth camera panning motion and a consistent studio background throughout."
+}
+```
+
+**Expected on-chain effect:**
+- Order status -> `FULFILLED`
+- Seller receives 15 GEN (10 payment + 5 stake back)
+
+**Step 3 -- Query the order:**
+```
+get_order("1")
+```
+Returns JSON with `"status": "FULFILLED"`, `"verdict": "RELEASE"`, and the
+AI's reason string.
+
+## Running Tests
+
+```bash
+pip install -r requirements-dev.txt
+gltest tests/
+```
+
+## License
+
+MIT
